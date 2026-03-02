@@ -104,20 +104,18 @@ class EncoderBlock(nn.Module):
         self.resnet_block_2 = ResidualBlock(out_channels, out_channels)
         self.time_emb_mlp = TimeEmbeddingMLP(output_size=out_channels)
         self.transformer_block = TransformerBlock(embed_dim=out_channels, n_heads=4, n_dense_units=4*out_channels)
-        self.conv = nn.Conv2d(in_channels=out_channels, out_channels=out_channels, kernel_size=3, stride=2, padding=1, device=device)  # downsampling
-        nn.init.xavier_normal_(self.conv.weight)
+        self.conv_downsampling = nn.Conv2d(in_channels=out_channels, out_channels=out_channels, kernel_size=3, stride=2, padding=1, device=device)  # spatial downsampling
+        nn.init.xavier_normal_(self.conv_downsampling.weight)
 
         self.out_channels = out_channels
 
     def forward(self, x: torch.Tensor, time_embedding: torch.Tensor, skip_connections: list):
         x = self.resnet_block_1(x)
         x = self.resnet_block_2(x)
-        self.time_emb = self.time_emb_mlp(time_embedding).reshape(x.shape[0], self.out_channels, 1, 1)  # [C] -> [B, C, 1, 1]
-
-        x = torch.add(x, self.time_emb)
+        time_emb = self.time_emb_mlp(time_embedding).reshape(x.shape[0], self.out_channels, 1, 1)  # [C] -> [B, C, 1, 1]
+        x = torch.add(x, time_emb)
         x = self.transformer_block(x)
-        x = self.conv(x)
-
+        x = self.conv_downsampling(x)
         skip_connections.append(x)
 
         return x
@@ -130,21 +128,24 @@ class DecoderBlock(nn.Module):
             self.resnet_block_2 = ResidualBlock(out_channels, out_channels)
             self.time_emb_mlp = TimeEmbeddingMLP(output_size=out_channels)
             self.transformer_block = TransformerBlock(embed_dim=out_channels, n_heads=4, n_dense_units=4*out_channels)
-            self.conv_transp = nn.ConvTranspose2d(in_channels=out_channels, out_channels=out_channels, kernel_size=3, stride=2, padding=1, device=device)  # upsampling
-            nn.init.xavier_normal_(self.conv_transp.weight)
+
+            output_padding = 0
+            if out_channels == 32:  # last decoder
+                output_padding = 1
+                
+            self.conv_upsampling = nn.ConvTranspose2d(in_channels=out_channels, out_channels=out_channels, kernel_size=3, stride=2, padding=1, output_padding=output_padding, device=device)  # spatial upsampling
+            nn.init.xavier_normal_(self.conv_upsampling.weight)
 
             self.out_channels = out_channels
 
         def forward(self, x: torch.Tensor, time_embedding: torch.Tensor, skip_connection: torch.Tensor):
             x = torch.cat((x, skip_connection), dim=1)
-
             x = self.resnet_block_1(x)
             x = self.resnet_block_2(x)
-            self.time_emb = self.time_emb_mlp(time_embedding).reshape(x.shape[0], self.out_channels, 1, 1)  
-
-            x = torch.add(x, self.time_emb)
+            time_emb = self.time_emb_mlp(time_embedding).reshape(x.shape[0], self.out_channels, 1, 1)  
+            x = torch.add(x, time_emb)
             x = self.transformer_block(x)
-            x = self.conv_transp(x)
+            x = self.conv_upsampling(x)
 
             return x
 
@@ -168,8 +169,8 @@ class UNet(nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.conv_1 = nn.Conv2d(in_channels=4, out_channels=32, kernel_size=1, device=device)  # (B, C, H, W)
-        nn.init.xavier_normal_(self.conv_1.weight) 
+        self.conv_channel_up = nn.Conv2d(in_channels=4, out_channels=32, kernel_size=1, device=device)  # channel upsampling, (B, C, H, W)
+        nn.init.xavier_normal_(self.conv_channel_up.weight)  
         self.noise_embedding = SinusoidalEmbedding(config_file['time_embedding_size'])
 
         self.encoder_block_1 = EncoderBlock(in_channels=32, out_channels=32)
@@ -186,14 +187,14 @@ class UNet(nn.Module):
         self.decoder_block_3 = DecoderBlock(in_channels=96+64, out_channels=64)
         self.decoder_block_4 = DecoderBlock(in_channels=64+32, out_channels=32)
 
-        self.conv_2 = nn.Conv2d(in_channels=32, out_channels=2, kernel_size=1, device=device)
-        nn.init.zeros_(self.conv_2.weight) 
+        self.conv_channel_down = nn.Conv2d(in_channels=32, out_channels=2, kernel_size=1, padding=0, device=device)
+        nn.init.zeros_(self.conv_channel_down.weight)  # channel downsampling
 
     def forward(self, x: torch.Tensor, time_embedding: torch.Tensor):
         skip_connections = []
 
         noise_emb = self.noise_embedding(time_embedding)
-        x = self.conv_1(x)
+        x = self.conv_channel_up(x)
 
         x = self.encoder_block_1(x, noise_emb, skip_connections)
         x = self.encoder_block_2(x, noise_emb, skip_connections)
@@ -203,13 +204,13 @@ class UNet(nn.Module):
         x = self.resnet_block_1(x)
         x = self.transformer_block(x)
         x = self.resnet_block_2(x)
-
+        
         x = self.decoder_block_1(x, noise_emb, skip_connections[3])
         x = self.decoder_block_2(x, noise_emb, skip_connections[2])
         x = self.decoder_block_3(x, noise_emb, skip_connections[1])
         x = self.decoder_block_4(x, noise_emb, skip_connections[0])
 
-        x = self.conv_2(x)
+        x = self.conv_channel_down(x)
 
         return x
     
