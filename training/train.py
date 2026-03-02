@@ -68,7 +68,7 @@ class DiffusionModel:
             with torch.no_grad():
                 noise_pred = model(noisy_images, noise_factors**2)
 
-        images_pred = (noisy_images[:, :2, :, :] - noise_factors * noise_pred) / image_factors  # ommit the channels for initial conditions and physical time
+        images_pred = torch.divide(torch.add(noisy_images[:, :2, :, :], -torch.mul(noise_factors, noise_pred)), image_factors)  # ommit the channels for initial conditions and physical time
 
         return images_pred, noise_pred
 
@@ -124,11 +124,10 @@ class DiffusionModel:
             mse_train_loss = mse_train_loss / n_train_batches
             mse_train_history.append(mse_train_loss)
 
-            print(f"Epoch: {epoch+1}, train MSE: {mse_train_loss:.5f}")
+            print(f"Epoch: {epoch+1} | train MSE: {mse_train_loss:.5f}")
             
         torch.save(self.model.state_dict(), model_path)
         torch.save(self.ema_model.state_dict(), ema_model_path)
             
         return mse_train_history
     
-    # def sampling(self):
