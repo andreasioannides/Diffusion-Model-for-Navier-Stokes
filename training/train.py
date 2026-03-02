@@ -23,18 +23,18 @@ class DiffusionModel:
         self.model = None
         self.ema_model = None
 
-    def factors_cosine_schedule(self, diffusion_timesteps: torch.Tensor) -> tuple:
-        '''Define a codine schedule for the image and noise factors. (img_factor^2 + noise_factor^2 = 1)'''
+    def factors_cosine_schedule(self, diffusion_timestep: torch.Tensor) -> tuple:
+        '''Given a batch of diffusion steps t, calculate the values of the image and noise factors defined by a cosine schedule. (img_factor^2 + noise_factor^2 = 1)'''
 
         image_factor_min = config_file['cosine_schedule']['image_factor_min']
         image_factor_max = config_file['cosine_schedule']['image_factor_max']
 
         start_angle = torch.acos(torch.tensor(image_factor_max, device=device))
         end_angle = torch.acos(torch.tensor(image_factor_min, device=device))
-        diffusion_angles = start_angle + diffusion_timesteps * (end_angle - start_angle)
+        diffusion_angle = start_angle + diffusion_timestep * (end_angle - start_angle)
 
-        image_factors = torch.cos(diffusion_angles)
-        noise_factors = torch.sin(diffusion_angles)
+        image_factors = torch.cos(diffusion_angle)
+        noise_factors = torch.sin(diffusion_angle)
 
         return image_factors, noise_factors
 
@@ -48,29 +48,12 @@ class DiffusionModel:
         elif isinstance(grid_size, tuple):
             noise = torch.normal(mean=0, std=1, size=(batch_size, 2, grid_size[0], grid_size[1]), device=device)
 
-        diffusion_timesteps = torch.rand(batch_size, 1, 1, 1, device=device)
-        image_factors, noise_factors = self.factors_cosine_schedule(diffusion_timesteps)
+        diffusion_timestep = torch.rand(batch_size, 1, 1, 1, device=device)
+        image_factors, noise_factors = self.factors_cosine_schedule(diffusion_timestep)
         noisy_images = images.clone()
         noisy_images[:, :2, :, :] = image_factors[:, :2, :, :] * images[:, :2, :, :] + noise_factors * noise
 
         return noisy_images, noise, image_factors, noise_factors
-    
-    def reverse_diffusion(self, noisy_images: torch.Tensor, image_factors: torch.Tensor, noise_factors: torch.Tensor, training: bool) -> Tuple[torch.Tensor, torch.Tensor]:
-        '''Predict the added noise to the image x_t and denoise the image.'''
-
-        if training:
-            model = self.model
-            noise_pred = model(noisy_images, noise_factors**2)
-        else:
-            model = self.ema_model
-            model.eval()
-
-            with torch.no_grad():
-                noise_pred = model(noisy_images, noise_factors**2)
-
-        images_pred = torch.divide(torch.add(noisy_images[:, :2, :, :], -torch.mul(noise_factors, noise_pred)), image_factors)  # ommit the channels for initial conditions and physical time
-
-        return images_pred, noise_pred
 
     def train(self, denoising_model: nn.Module, train_dataloader: DataLoader, n_epochs: int, model_path: str, ema_model_path: str) -> List:
         grid_size = config_file['grid_size']
@@ -106,7 +89,8 @@ class DiffusionModel:
                 x_batch = x_batch.to(device=device)
 
                 noisy_images, noise, image_factors, noise_factors = self.diffusion(x_batch, grid_size)
-                images_pred, noise_pred = self.reverse_diffusion(noisy_images, image_factors, noise_factors, training=True) 
+                noise_pred = self.model(noisy_images, torch.pow(noise_factors, 2))
+                # images_pred = torch.divide(torch.add(noisy_images[:, :2, :, :], -torch.mul(noise_factors, noise_pred)), image_factors)  # ommit the channels for initial conditions and physical time
 
                 batch_loss = criterion(noise, noise_pred) / n_train_batches  
                 batch_loss.backward()                  
@@ -130,4 +114,3 @@ class DiffusionModel:
         torch.save(self.ema_model.state_dict(), ema_model_path)
             
         return mse_train_history
-    
