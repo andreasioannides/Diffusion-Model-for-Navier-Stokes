@@ -6,6 +6,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import copy
 from typing import Union, Tuple, List
+import math
 
 
 SEED_NUM = 42
@@ -23,37 +24,36 @@ class DiffusionModel:
         self.model = None
         self.ema_model = None
 
-    def factors_cosine_schedule(self, diffusion_timestep: torch.Tensor) -> tuple:
-        '''Given a batch of diffusion steps t, calculate the values of the image and noise factors defined by a cosine schedule. (img_factor^2 + noise_factor^2 = 1)'''
+    def noise_cosine_scheduling(self, diffusion_timestep: Union[float, torch.Tensor]) -> Union[float, torch.Tensor]:
+        '''Given the diffusion steps t for a batch of images, calculate the alpha_hat defined by a cosine schedule.'''
 
-        image_factor_min = config_file['cosine_schedule']['image_factor_min']
-        image_factor_max = config_file['cosine_schedule']['image_factor_max']
+        s = config_file['noise_cosine_schedule']['s']
 
-        start_angle = torch.acos(torch.tensor(image_factor_max, device=device))
-        end_angle = torch.acos(torch.tensor(image_factor_min, device=device))
-        diffusion_angle = start_angle + diffusion_timestep * (end_angle - start_angle)
-
-        image_factors = torch.cos(diffusion_angle)
-        noise_factors = torch.sin(diffusion_angle)
-
-        return image_factors, noise_factors
-
-    def diffusion(self, images: torch.Tensor, grid_size: Union[int, tuple]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        '''Add noise to the images.'''
+        def f(t: Union[float, torch.Tensor]):
+            if isinstance(t, float):
+                return math.cos((t+s)/(1+s) * math.pi/2)**2
+            elif isinstance(t, torch.Tensor):
+                return torch.cos((t+s)/(1+s) * torch.pi/2)**2
         
-        batch_size = images.shape[0]
+        alpha_hat = f(diffusion_timestep) / f(0.)
+
+        return alpha_hat
+
+    def diffusion(self, image: torch.Tensor, diffusion_timestep: torch.Tensor, grid_size: Union[int, tuple]) -> Tuple[torch.Tensor, torch.Tensor]:
+        '''Add noise to a batch of images.'''
+        
+        batch_size = image.shape[0]
 
         if isinstance(grid_size, int):
             noise = torch.normal(mean=0, std=1, size=(batch_size, 2, grid_size, grid_size), device=device)
         elif isinstance(grid_size, tuple):
             noise = torch.normal(mean=0, std=1, size=(batch_size, 2, grid_size[0], grid_size[1]), device=device)
 
-        diffusion_timestep = torch.rand(batch_size, 1, 1, 1, device=device)
-        image_factors, noise_factors = self.factors_cosine_schedule(diffusion_timestep)
-        noisy_images = images.clone()
-        noisy_images[:, :2, :, :] = image_factors[:, :2, :, :] * images[:, :2, :, :] + noise_factors * noise
+        alpha_hat = self.noise_cosine_scheduling(diffusion_timestep)
+        noisy_images = image.clone()
+        noisy_images[:, :2, :, :] = torch.sqrt(alpha_hat) * image[:, :2, :, :] + torch.sqrt(1-alpha_hat) * noise
 
-        return noisy_images, noise, image_factors, noise_factors
+        return noisy_images, noise
 
     def train(self, denoising_model: nn.Module, train_dataloader: DataLoader, n_epochs: int, model_path: str, ema_model_path: str) -> List:
         grid_size = config_file['grid_size']
@@ -88,11 +88,11 @@ class DiffusionModel:
                 optimizer.zero_grad()  
                 x_batch = x_batch.to(device=device)
 
-                noisy_images, noise, image_factors, noise_factors = self.diffusion(x_batch, grid_size)
-                noise_pred = self.model(noisy_images, torch.pow(noise_factors, 2))
-                # images_pred = torch.divide(torch.add(noisy_images[:, :2, :, :], -torch.mul(noise_factors, noise_pred)), image_factors)  # ommit the channels for initial conditions and physical time
+                diffusion_timestep = torch.rand(x_batch.shape[0], 1, 1, 1, device=device)
+                noisy_images, noise = self.diffusion(x_batch, diffusion_timestep, grid_size)
+                noise_pred = self.model(noisy_images, diffusion_timestep)
 
-                batch_loss = criterion(noise, noise_pred) / n_train_batches  
+                batch_loss = criterion(noise, noise_pred)  
                 batch_loss.backward()                  
                 optimizer.step()
                 mse_train_loss += batch_loss.item()
@@ -110,7 +110,50 @@ class DiffusionModel:
 
             print(f"Epoch: {epoch+1} | train MSE: {mse_train_loss:.5f}")
             
-        torch.save(self.model.state_dict(), model_path)
-        torch.save(self.ema_model.state_dict(), ema_model_path)
+        print('\nTraining finished.\n')
+        # torch.save(self.model.state_dict(), model_path)
+        # torch.save(self.ema_model.state_dict(), ema_model_path)
             
         return mse_train_history
+    
+    def sampling(self, n_diffusion_steps: int, initial_cond: torch.Tensor) -> torch.Tensor:
+        '''Generate a new field based on the given initial_cond (initial conditions + physical time).'''
+
+        noise = torch.normal(mean=0, std=1, size=(1, 2, config_file['grid_size'], config_file['grid_size']), device=device)
+
+        alpha_hat_list = []
+        beta_list = []
+        diffusion_timesteps = torch.linspace(0, 1, n_diffusion_steps+1, device=device)
+
+        for t in range(len(diffusion_timesteps)):
+            alpha_hat = self.noise_cosine_scheduling(diffusion_timesteps[t])
+            alpha_hat_list.append(alpha_hat)
+
+            if t > 0:
+                beta_t = 1 - alpha_hat / (alpha_hat_list[t-1])
+            else: 
+                beta_t = 1 - alpha_hat
+
+            beta_list.append(beta_t)
+
+        model = self.ema_model
+        model.eval()
+        current_image = torch.cat((noise, initial_cond), dim=1)
+
+        for i, t in enumerate(reversed(range(n_diffusion_steps)), start=1):
+            alpha_hat = alpha_hat_list[-i]
+            beta_t = beta_list[-i]
+            alpha_t = 1 - beta_t
+            diffusion_timestep = torch.full((1, 1, 1, 1), fill_value=diffusion_timesteps[-i], device=device)
+
+            with torch.no_grad():
+                noise_pred = model(current_image, diffusion_timestep)  
+
+            if t > 0:
+                z = torch.randn_like(noise, device=device)
+            else:
+                z = torch.zeros_like(noise)
+
+            current_image[:, :2, :, :] = 1 / (math.sqrt(alpha_t) + 1e-8) * (current_image[:, :2, :, :] - (1-alpha_t)/math.sqrt(1-alpha_hat) * noise_pred) + math.sqrt(beta_t) * z  
+
+        return current_image
