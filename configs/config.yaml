@@ -1,9 +1,8 @@
 time_embedding_size: 128
 grid_size: 50
 
-cosine_schedule:
-  image_factor_min: 0.02
-  image_factor_max: 0.95
+noise_cosine_schedule:
+  s: 0.2
 
 training:
   EMA_coeff: 0.99
@@ -11,5 +10,5 @@ training:
   lr_init: 0.0001
   lr_decay_rate: 0.9
   lr_decay_steps: 50
-  epochs: 40
+  epochs: 1
   batch_size: 8
