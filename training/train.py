@@ -103,7 +103,7 @@ class DiffusionModel:
 
                 with torch.no_grad():
                     for model_param, ema_model_param in zip(self.model.parameters(), self.ema_model.parameters()):
-                        ema_model_param.data.mul_(EMA_coef).add_(model_param.data, alpha=1 - EMA_coef)
+                        ema_model_param.data.mul_(EMA_coef).add_(model_param.data, alpha=1-EMA_coef)
 
             mse_train_loss = mse_train_loss / n_train_batches
             mse_train_history.append(mse_train_loss)
