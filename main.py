@@ -21,7 +21,7 @@ with open(config_path, "r", encoding="utf-8") as file:
 class PDEsDataset(Dataset):
     def __init__(self):
         data = torch.full((64, 4, 50, 50), 10.)
-        self.data = torch.tensor(data)
+        self.data = torch.tensor(data, device=device)
         
     def __len__(self):
         return self.data.shape[0]
@@ -43,3 +43,6 @@ model = UNet().to(device)
 # time_emb = torch.tensor([[[5.]]])
 
 diffusion_model.train(model, train_dataloader, n_epochs, model_path, ema_model_path)
+initial_cond = torch.full((1, 2, 50, 50), 10.)  # 2 channels: density at physical time t and physical time t
+field_pred = diffusion_model.sampling(130, initial_cond)
+print(field_pred.shape)
